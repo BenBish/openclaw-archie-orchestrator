@@ -1,0 +1,34 @@
+{
+  "plugins": {
+    "allow": ["archie-orchestrator"],
+    "entries": {
+      "archie-orchestrator": {
+        "enabled": true,
+        "config": {
+          "stateRoot": "~/.openclaw-archie-orchestrator/state",
+          "worker": {
+            "command": "claude",
+            "defaultModel": "claude-sonnet-4-6",
+            "maxTurns": 75
+          },
+          "concurrency": {
+            "maxActiveWorkers": 1
+          },
+          "issueProvider": {
+            "type": "linear",
+            "linear": {
+              "teamKey": "ENG"
+            }
+          },
+          "verification": {
+            "ciCommand": "npm test",
+            "e2eCommand": "npm run test:e2e"
+          },
+          "review": {
+            "requireManualTesting": true
+          }
+        }
+      }
+    }
+  }
+}
