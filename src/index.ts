@@ -310,6 +310,142 @@ function newStatus(input: {
   };
 }
 
+// ─── Tool execute implementations ────────────────────────────────────────────
+
+async function execTaskInit(input: any, config: any) {
+  const paths = await ensureRoot(input.stateRoot, config.stateRoot);
+  const dir = taskDir(paths, input.taskId);
+  if (existsSync(statusPath(paths, input.taskId))) {
+    throw new Error(`Task already exists: ${input.taskId}`);
+  }
+  await mkdir(dir, { recursive: true });
+  await mkdir(join(dir, "artifacts"), { recursive: true });
+  const status = await saveStatus(paths, newStatus(input));
+  await writeFile(join(dir, "request.md"), input.request ?? `# Request\n\n${input.title}\n`, "utf8");
+  await writeFile(join(dir, "context.md"), input.context ?? "# Context\n\n", "utf8");
+  await writeFile(join(dir, "acceptance.md"), input.acceptance ?? "# Acceptance Criteria\n\n", "utf8");
+  await writeFile(join(dir, "review-notes.md"), input.reviewNotes ?? "# Review Notes\n\n", "utf8");
+  await appendEvent(paths, input.taskId, { type: "task_initialized", state: "queued" });
+  const queue = await refreshQueue(paths);
+  return { status, queue, taskDir: dir };
+}
+
+async function execTaskRead({ taskId, stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  const dir = taskDir(paths, taskId);
+  const readText = async (name: string) => {
+    const path = join(dir, name);
+    return existsSync(path) ? readFile(path, "utf8") : "";
+  };
+  return {
+    status: await loadStatus(paths, taskId),
+    files: {
+      request: await readText("request.md"),
+      context: await readText("context.md"),
+      acceptance: await readText("acceptance.md"),
+      reviewNotes: await readText("review-notes.md"),
+    },
+  };
+}
+
+async function execTaskTransition({ taskId, state, outcome, summary, commentUrl, headRef, stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  const status = await loadStatus(paths, taskId);
+  const allowed = ALLOWED_TRANSITIONS[status.state];
+  if (!allowed?.has(state)) {
+    throw new Error(`Invalid transition for ${taskId}: ${status.state} -> ${state}`);
+  }
+  const previousState = status.state;
+  status.state = state;
+  if (state === "running" || state === "retry_running") {
+    status.attempt += 1;
+  }
+  if (state === "awaiting_review") {
+    status.review.startedAt ??= nowIso();
+    status.review.headRef = headRef ?? status.review.headRef;
+  }
+  if (state === "awaiting_manual_testing") {
+    status.manualTesting.startedAt ??= nowIso();
+  }
+  if (state === "completed" || state === "blocked" || state === "cancelled") {
+    status.review.completedAt ??= status.review.startedAt ? nowIso() : null;
+    status.manualTesting.completedAt ??= status.manualTesting.startedAt ? nowIso() : null;
+  }
+  const isManualTestingPhase = state === "awaiting_manual_testing" || previousState === "awaiting_manual_testing";
+  if (commentUrl) {
+    if (isManualTestingPhase) status.manualTesting.commentUrl = commentUrl;
+    else status.review.commentUrl = commentUrl;
+  }
+  if (outcome) {
+    if (isManualTestingPhase) status.manualTesting.outcome = outcome;
+    else status.review.outcome = outcome;
+  }
+  await saveStatus(paths, status);
+  await appendEvent(paths, taskId, { type: "state_transition", state, summary: summary ?? null });
+  const queue = await refreshQueue(paths);
+  return { status, queue };
+}
+
+async function execTaskUpdate({ taskId, request, context, acceptance, reviewNotes, stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  await loadStatus(paths, taskId);
+  const dir = taskDir(paths, taskId);
+  const updated: string[] = [];
+  if (request !== undefined) { await writeFile(join(dir, "request.md"), request, "utf8"); updated.push("request"); }
+  if (context !== undefined) { await writeFile(join(dir, "context.md"), context, "utf8"); updated.push("context"); }
+  if (acceptance !== undefined) { await writeFile(join(dir, "acceptance.md"), acceptance, "utf8"); updated.push("acceptance"); }
+  if (reviewNotes !== undefined) { await writeFile(join(dir, "review-notes.md"), reviewNotes, "utf8"); updated.push("reviewNotes"); }
+  await appendEvent(paths, taskId, { type: "task_updated", files: updated as unknown as JsonValue });
+  return { taskId, updated };
+}
+
+async function execQueueStatus({ stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  const statuses = await listStatuses(paths);
+  const queue = await refreshQueue(paths);
+  return {
+    queue,
+    active: statuses.filter((status) => ACTIVE_STATES.has(status.state)),
+    pending: statuses.filter((status) => !TERMINAL_STATES.has(status.state) && !ACTIVE_STATES.has(status.state)),
+    terminal: statuses.filter((status) => TERMINAL_STATES.has(status.state)),
+  };
+}
+
+async function execUsageReport({ stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  const statuses = await listStatuses(paths);
+  const totals = statuses.reduce(
+    (acc, status) => {
+      acc.tasks += 1;
+      acc.costUsd += status.usage?.totals?.costUsd ?? 0;
+      acc.inputTokens += status.usage?.totals?.inputTokens ?? 0;
+      acc.outputTokens += status.usage?.totals?.outputTokens ?? 0;
+      acc.turns += status.usage?.totals?.turns ?? 0;
+      return acc;
+    },
+    { tasks: 0, costUsd: 0, inputTokens: 0, outputTokens: 0, turns: 0 },
+  );
+  return {
+    stateRoot: paths.root,
+    totals,
+    tasks: statuses.map((status) => ({
+      taskId: status.taskId,
+      state: status.state,
+      usage: status.usage?.totals,
+    })),
+  };
+}
+
+// Exported for testing: provides direct access to execute handlers without going through the SDK metadata API.
+export const _toolExecutors: Record<string, (input: any, config: any) => Promise<unknown>> = {
+  archie_task_init: execTaskInit,
+  archie_task_read: execTaskRead,
+  archie_task_transition: execTaskTransition,
+  archie_task_update: execTaskUpdate,
+  archie_queue_status: execQueueStatus,
+  archie_usage_report: execUsageReport,
+};
+
 export default defineToolPlugin({
   id: "archie-orchestrator",
   name: "Archie Orchestrator",
@@ -333,23 +469,7 @@ export default defineToolPlugin({
         reviewNotes: Type.Optional(Type.String({ description: "Initial review-notes.md content." })),
         stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
       }),
-      execute: async (input: any, config: any) => {
-        const paths = await ensureRoot(input.stateRoot, config.stateRoot);
-        const dir = taskDir(paths, input.taskId);
-        if (existsSync(statusPath(paths, input.taskId))) {
-          throw new Error(`Task already exists: ${input.taskId}`);
-        }
-        await mkdir(dir, { recursive: true });
-        await mkdir(join(dir, "artifacts"), { recursive: true });
-        const status = await saveStatus(paths, newStatus(input));
-        await writeFile(join(dir, "request.md"), input.request ?? `# Request\n\n${input.title}\n`, "utf8");
-        await writeFile(join(dir, "context.md"), input.context ?? "# Context\n\n", "utf8");
-        await writeFile(join(dir, "acceptance.md"), input.acceptance ?? "# Acceptance Criteria\n\n", "utf8");
-        await writeFile(join(dir, "review-notes.md"), input.reviewNotes ?? "# Review Notes\n\n", "utf8");
-        await appendEvent(paths, input.taskId, { type: "task_initialized", state: "queued" });
-        const queue = await refreshQueue(paths);
-        return { status, queue, taskDir: dir };
-      },
+      execute: execTaskInit,
     }),
     tool({
       name: "archie_task_read",
@@ -358,23 +478,7 @@ export default defineToolPlugin({
         taskId: Type.String(),
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ taskId, stateRoot }: any, config: any) => {
-        const paths = await ensureRoot(stateRoot, config.stateRoot);
-        const dir = taskDir(paths, taskId);
-        const readText = async (name: string) => {
-          const path = join(dir, name);
-          return existsSync(path) ? readFile(path, "utf8") : "";
-        };
-        return {
-          status: await loadStatus(paths, taskId),
-          files: {
-            request: await readText("request.md"),
-            context: await readText("context.md"),
-            acceptance: await readText("acceptance.md"),
-            reviewNotes: await readText("review-notes.md"),
-          },
-        };
-      },
+      execute: execTaskRead,
     }),
     tool({
       name: "archie_task_transition",
@@ -382,42 +486,26 @@ export default defineToolPlugin({
       parameters: Type.Object({
         taskId: Type.String(),
         state: Type.String({ description: "Target lifecycle state." }),
+        outcome: Type.Optional(Type.String({ description: "Phase outcome, e.g. approved, rejected, passed, failed." })),
         summary: Type.Optional(Type.String()),
         commentUrl: Type.Optional(Type.String()),
         headRef: Type.Optional(Type.String()),
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ taskId, state, summary, commentUrl, headRef, stateRoot }: any, config: any) => {
-        const paths = await ensureRoot(stateRoot, config.stateRoot);
-        const status = await loadStatus(paths, taskId);
-        const allowed = ALLOWED_TRANSITIONS[status.state];
-        if (!allowed?.has(state)) {
-          throw new Error(`Invalid transition for ${taskId}: ${status.state} -> ${state}`);
-        }
-        status.state = state;
-        if (state === "running" || state === "retry_running") {
-          status.attempt += 1;
-        }
-        if (state === "awaiting_review") {
-          status.review.startedAt ??= nowIso();
-          status.review.headRef = headRef ?? status.review.headRef;
-        }
-        if (state === "awaiting_manual_testing") {
-          status.manualTesting.startedAt ??= nowIso();
-        }
-        if (state === "completed" || state === "blocked" || state === "cancelled") {
-          status.review.completedAt ??= status.review.startedAt ? nowIso() : null;
-          status.manualTesting.completedAt ??= status.manualTesting.startedAt ? nowIso() : null;
-        }
-        if (commentUrl) {
-          if (state === "awaiting_manual_testing" || state === "completed") status.manualTesting.commentUrl = commentUrl;
-          else status.review.commentUrl = commentUrl;
-        }
-        await saveStatus(paths, status);
-        await appendEvent(paths, taskId, { type: "state_transition", state, summary: summary ?? null });
-        const queue = await refreshQueue(paths);
-        return { status, queue };
-      },
+      execute: execTaskTransition,
+    }),
+    tool({
+      name: "archie_task_update",
+      description: "Update task files (request, context, acceptance, review-notes) for an existing Archie task.",
+      parameters: Type.Object({
+        taskId: Type.String(),
+        request: Type.Optional(Type.String()),
+        context: Type.Optional(Type.String()),
+        acceptance: Type.Optional(Type.String()),
+        reviewNotes: Type.Optional(Type.String()),
+        stateRoot: Type.Optional(Type.String()),
+      }),
+      execute: execTaskUpdate,
     }),
     tool({
       name: "archie_queue_status",
@@ -425,17 +513,7 @@ export default defineToolPlugin({
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ stateRoot }: any, config: any) => {
-        const paths = await ensureRoot(stateRoot, config.stateRoot);
-        const statuses = await listStatuses(paths);
-        const queue = await refreshQueue(paths);
-        return {
-          queue,
-          active: statuses.filter((status) => ACTIVE_STATES.has(status.state)),
-          pending: statuses.filter((status) => !TERMINAL_STATES.has(status.state) && !ACTIVE_STATES.has(status.state)),
-          terminal: statuses.filter((status) => TERMINAL_STATES.has(status.state)),
-        };
-      },
+      execute: execQueueStatus,
     }),
     tool({
       name: "archie_usage_report",
@@ -443,30 +521,7 @@ export default defineToolPlugin({
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ stateRoot }: any, config: any) => {
-        const paths = await ensureRoot(stateRoot, config.stateRoot);
-        const statuses = await listStatuses(paths);
-        const totals = statuses.reduce(
-          (acc, status) => {
-            acc.tasks += 1;
-            acc.costUsd += status.usage?.totals?.costUsd ?? 0;
-            acc.inputTokens += status.usage?.totals?.inputTokens ?? 0;
-            acc.outputTokens += status.usage?.totals?.outputTokens ?? 0;
-            acc.turns += status.usage?.totals?.turns ?? 0;
-            return acc;
-          },
-          { tasks: 0, costUsd: 0, inputTokens: 0, outputTokens: 0, turns: 0 },
-        );
-        return {
-          stateRoot: paths.root,
-          totals,
-          tasks: statuses.map((status) => ({
-            taskId: status.taskId,
-            state: status.state,
-            usage: status.usage?.totals,
-          })),
-        };
-      },
+      execute: execUsageReport,
     }),
   ],
 });
