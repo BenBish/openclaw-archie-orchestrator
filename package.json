@@ -23,9 +23,7 @@
   "peerDependencies": {
     "openclaw": ">=2026.5.17"
   },
-  "dependencies": {
-    "typebox": "^1.1.38"
-  },
+  "dependencies": {},
   "devDependencies": {
     "openclaw": "latest",
     "typescript": "^5.9.0",

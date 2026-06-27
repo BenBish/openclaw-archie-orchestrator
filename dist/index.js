@@ -1,9 +1,38 @@
-import { Type } from "typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+const Type = {
+    String: (options = {}) => ({
+        type: "string",
+        ...(options.description ? { description: options.description } : {}),
+    }),
+    Number: () => ({ type: "number" }),
+    Boolean: (options = {}) => ({
+        type: "boolean",
+        ...(options.description ? { description: options.description } : {}),
+    }),
+    Literal: (value) => ({ type: "string", const: value }),
+    Union: (schemas) => ({ anyOf: schemas }),
+    Optional: (schema) => ({ ...schema, __optional: true }),
+    Object: (properties, options = {}) => {
+        const cleanProperties = {};
+        const required = [];
+        for (const [key, schema] of Object.entries(properties)) {
+            const { __optional, ...cleanSchema } = schema;
+            cleanProperties[key] = cleanSchema;
+            if (!__optional)
+                required.push(key);
+        }
+        return {
+            type: "object",
+            properties: cleanProperties,
+            ...(required.length > 0 ? { required } : {}),
+            additionalProperties: options.additionalProperties ?? false,
+        };
+    },
+};
 const ACTIVE_STATES = new Set(["preparing", "running", "retry_running"]);
 const TERMINAL_STATES = new Set(["blocked", "completed", "cancelled"]);
 const CONFIG_SCHEMA = Type.Object({

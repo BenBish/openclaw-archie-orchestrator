@@ -1,4 +1,3 @@
-import { Type } from "typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -6,6 +5,37 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+type Schema = Record<string, unknown> & { __optional?: boolean };
+
+const Type = {
+  String: (options: { description?: string } = {}): Schema => ({
+    type: "string",
+    ...(options.description ? { description: options.description } : {}),
+  }),
+  Number: (): Schema => ({ type: "number" }),
+  Boolean: (options: { description?: string } = {}): Schema => ({
+    type: "boolean",
+    ...(options.description ? { description: options.description } : {}),
+  }),
+  Literal: (value: string): Schema => ({ type: "string", const: value }),
+  Union: (schemas: Schema[]): Schema => ({ anyOf: schemas }),
+  Optional: (schema: Schema): Schema => ({ ...schema, __optional: true }),
+  Object: (properties: Record<string, Schema>, options: { additionalProperties?: boolean } = {}): Schema => {
+    const cleanProperties: Record<string, Schema> = {};
+    const required: string[] = [];
+    for (const [key, schema] of Object.entries(properties)) {
+      const { __optional, ...cleanSchema } = schema;
+      cleanProperties[key] = cleanSchema;
+      if (!__optional) required.push(key);
+    }
+    return {
+      type: "object",
+      properties: cleanProperties,
+      ...(required.length > 0 ? { required } : {}),
+      additionalProperties: options.additionalProperties ?? false,
+    };
+  },
+};
 
 type TaskStatus = {
   taskId: string;
@@ -303,7 +333,7 @@ export default defineToolPlugin({
         reviewNotes: Type.Optional(Type.String({ description: "Initial review-notes.md content." })),
         stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
       }),
-      execute: async (input, config) => {
+      execute: async (input: any, config: any) => {
         const paths = await ensureRoot(input.stateRoot, config.stateRoot);
         const dir = taskDir(paths, input.taskId);
         if (existsSync(statusPath(paths, input.taskId))) {
@@ -328,7 +358,7 @@ export default defineToolPlugin({
         taskId: Type.String(),
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ taskId, stateRoot }, config) => {
+      execute: async ({ taskId, stateRoot }: any, config: any) => {
         const paths = await ensureRoot(stateRoot, config.stateRoot);
         const dir = taskDir(paths, taskId);
         const readText = async (name: string) => {
@@ -357,7 +387,7 @@ export default defineToolPlugin({
         headRef: Type.Optional(Type.String()),
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ taskId, state, summary, commentUrl, headRef, stateRoot }, config) => {
+      execute: async ({ taskId, state, summary, commentUrl, headRef, stateRoot }: any, config: any) => {
         const paths = await ensureRoot(stateRoot, config.stateRoot);
         const status = await loadStatus(paths, taskId);
         const allowed = ALLOWED_TRANSITIONS[status.state];
@@ -395,7 +425,7 @@ export default defineToolPlugin({
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ stateRoot }, config) => {
+      execute: async ({ stateRoot }: any, config: any) => {
         const paths = await ensureRoot(stateRoot, config.stateRoot);
         const statuses = await listStatuses(paths);
         const queue = await refreshQueue(paths);
@@ -413,7 +443,7 @@ export default defineToolPlugin({
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),
-      execute: async ({ stateRoot }, config) => {
+      execute: async ({ stateRoot }: any, config: any) => {
         const paths = await ensureRoot(stateRoot, config.stateRoot);
         const statuses = await listStatuses(paths);
         const totals = statuses.reduce(
