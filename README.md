@@ -26,6 +26,9 @@ openclaw plugins install --link .
 - `archie_task_init`: create task state and task files.
 - `archie_task_read`: inspect task status and notes.
 - `archie_task_transition`: move a task through the lifecycle.
+- `archie_task_start`: start implementation by walking queued/preparing tasks to running.
+- `archie_task_finish`: complete, block, or cancel a task through legal lifecycle states.
+- `archie_task_update`: update task request/context/acceptance/review-note files.
 - `archie_queue_status`: inspect active, pending, and terminal tasks.
 - `archie_usage_report`: summarize recorded usage totals.
 - Bundled skills:

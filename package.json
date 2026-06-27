@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-archie-orchestrator",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "private": false,
   "description": "Durable engineering task orchestration for OpenClaw agents.",

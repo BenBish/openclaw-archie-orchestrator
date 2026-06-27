@@ -19,15 +19,16 @@ Use Archie Orchestrator to turn a requested implementation into durable task sta
    - issue URL if known
    - request, context, acceptance criteria, and review notes
 4. Check `archie_queue_status` before launching implementation work.
-5. Launch the configured worker command using the task files as the source of truth.
-6. Record state transitions with `archie_task_transition`.
+5. Call `archie_task_start` before implementation begins. Do not pass `stateRoot` unless the user explicitly asks to use a non-default state directory.
+6. Launch the configured worker command using the task files as the source of truth, or implement directly when the user asked for a small local task.
 7. Run the configured CI and E2E commands.
 8. Review the diff before approval.
-9. Record manual testing when required.
+9. Call `archie_task_finish` with `result: "completed"` after tests pass, or `result: "blocked"` with a clear summary when implementation cannot be completed.
 
 ## Guardrails
 
 - Keep large issue payloads in task files, not chat.
+- Prefer `archie_task_start` and `archie_task_finish` for normal work; use `archie_task_transition` only when a specific one-step lifecycle transition is needed.
 - Do not merge a PR before review and manual testing requirements are complete.
 - Do not store secrets in task files.
 - Prefer project-local test commands from plugin config or repository docs.

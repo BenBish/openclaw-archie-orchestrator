@@ -35,3 +35,10 @@ cancelled
 ```
 
 The plugin tools enforce lifecycle transitions so task state remains durable and auditable.
+
+For normal implementation work, use:
+
+- `archie_task_start` after task creation or when implementation begins.
+- `archie_task_finish` after verification to mark the task `completed`, `blocked`, or `cancelled`.
+
+`archie_task_transition` remains strict and is best for advanced one-step lifecycle control. The helper tools still write one event per actual transition, so the audit trail remains explicit.

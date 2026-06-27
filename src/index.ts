@@ -18,6 +18,11 @@ const Type = {
     ...(options.description ? { description: options.description } : {}),
   }),
   Literal: (value: string): Schema => ({ type: "string", const: value }),
+  Enum: (values: string[], options: { description?: string } = {}): Schema => ({
+    type: "string",
+    enum: values,
+    ...(options.description ? { description: options.description } : {}),
+  }),
   Union: (schemas: Schema[]): Schema => ({ anyOf: schemas }),
   Optional: (schema: Schema): Schema => ({ ...schema, __optional: true }),
   Object: (properties: Record<string, Schema>, options: { additionalProperties?: boolean } = {}): Schema => {
@@ -81,6 +86,21 @@ type TaskStatus = {
 
 const ACTIVE_STATES = new Set(["preparing", "running", "retry_running"]);
 const TERMINAL_STATES = new Set(["blocked", "completed", "cancelled"]);
+const LIFECYCLE_STATES = [
+  "queued",
+  "preparing",
+  "running",
+  "awaiting_worker_exit_reconcile",
+  "awaiting_pr",
+  "awaiting_review",
+  "awaiting_manual_testing",
+  "retry_planned",
+  "retry_running",
+  "blocked",
+  "completed",
+  "cancelled",
+];
+const FINISH_RESULTS = ["completed", "blocked", "cancelled"];
 const CONFIG_SCHEMA = Type.Object(
   {
     stateRoot: Type.Optional(Type.String({ description: "Directory where Archie task state is stored." })),
@@ -143,6 +163,11 @@ const ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
   blocked: new Set(["cancelled"]),
   completed: new Set(["cancelled"]),
   cancelled: new Set(),
+};
+
+type ListStatusesResult = {
+  statuses: TaskStatus[];
+  diagnostics: { taskId: string; reason: string }[];
 };
 
 function nowIso(): string {
@@ -223,19 +248,69 @@ async function saveStatus(paths: ReturnType<typeof pathsFor>, status: TaskStatus
   return status;
 }
 
-async function listStatuses(paths: ReturnType<typeof pathsFor>): Promise<TaskStatus[]> {
-  if (!existsSync(paths.tasksDir)) return [];
+function allowedNextStates(state: string): string[] {
+  return [...(ALLOWED_TRANSITIONS[state] ?? new Set<string>())];
+}
+
+function suggestedNextTools(state: string): string[] {
+  if (state === "queued" || state === "preparing") return ["archie_task_start", "archie_task_transition"];
+  if (state === "running" || state === "retry_running" || state === "awaiting_worker_exit_reconcile" || state === "awaiting_review") {
+    return ["archie_task_finish", "archie_task_transition"];
+  }
+  if (TERMINAL_STATES.has(state)) return ["archie_task_read", "archie_queue_status"];
+  return ["archie_task_transition"];
+}
+
+function withGuidance<T extends { status?: TaskStatus }>(paths: ReturnType<typeof pathsFor>, payload: T): T & {
+  stateRoot: string;
+  allowedNextStates?: string[];
+  suggestedNextTools?: string[];
+} {
+  const state = payload.status?.state;
+  return {
+    ...payload,
+    stateRoot: paths.root,
+    ...(state ? { allowedNextStates: allowedNextStates(state), suggestedNextTools: suggestedNextTools(state) } : {}),
+  };
+}
+
+function transitionError(taskId: string, fromState: string, toState: string): Error {
+  const allowed = allowedNextStates(fromState);
+  const hint = fromState === "queued"
+    ? "Use archie_task_start before implementation or archie_task_finish to complete common flows."
+    : "Use archie_task_finish for common completion/block/cancel flows.";
+  return new Error(
+    `Invalid transition for ${taskId}: ${fromState} -> ${toState}. Allowed next states: ${allowed.join(", ") || "(none)"}. ${hint}`,
+  );
+}
+
+async function listStatuses(paths: ReturnType<typeof pathsFor>): Promise<ListStatusesResult> {
+  if (!existsSync(paths.tasksDir)) return { statuses: [], diagnostics: [] };
   const entries = await readdir(paths.tasksDir);
   const statuses: TaskStatus[] = [];
+  const diagnostics: { taskId: string; reason: string }[] = [];
   for (const entry of entries) {
     const path = statusPath(paths, entry);
     try {
-      if ((await stat(path)).isFile()) statuses.push(await readJson<TaskStatus>(path));
-    } catch {
-      // Ignore partial task directories so one bad task does not break queue inspection.
+      if (!(await stat(path)).isFile()) continue;
+      const status = await readJson<TaskStatus>(path);
+      if (!status || typeof status !== "object") {
+        diagnostics.push({ taskId: entry, reason: "status.json is not an object" });
+        continue;
+      }
+      if (typeof status.taskId !== "string" || typeof status.state !== "string") {
+        diagnostics.push({ taskId: entry, reason: "status.json is missing taskId or state" });
+        continue;
+      }
+      statuses.push(status);
+    } catch (error) {
+      diagnostics.push({ taskId: entry, reason: error instanceof Error ? error.message : "could not read status.json" });
     }
   }
-  return statuses.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return {
+    statuses: statuses.sort((a, b) => (a.createdAt ?? a.updatedAt ?? a.taskId).localeCompare(b.createdAt ?? b.updatedAt ?? b.taskId)),
+    diagnostics,
+  };
 }
 
 async function refreshQueue(paths: ReturnType<typeof pathsFor>): Promise<{
@@ -244,7 +319,7 @@ async function refreshQueue(paths: ReturnType<typeof pathsFor>): Promise<{
   items: string[];
   updatedAt: string;
 }> {
-  const statuses = await listStatuses(paths);
+  const { statuses } = await listStatuses(paths);
   const active = statuses.find((status) => ACTIVE_STATES.has(status.state));
   const queued = statuses.filter((status) => !TERMINAL_STATES.has(status.state) && !ACTIVE_STATES.has(status.state));
   const queue = {
@@ -327,7 +402,7 @@ async function execTaskInit(input: any, config: any) {
   await writeFile(join(dir, "review-notes.md"), input.reviewNotes ?? "# Review Notes\n\n", "utf8");
   await appendEvent(paths, input.taskId, { type: "task_initialized", state: "queued" });
   const queue = await refreshQueue(paths);
-  return { status, queue, taskDir: dir };
+  return withGuidance(paths, { status, queue, taskDir: dir });
 }
 
 async function execTaskRead({ taskId, stateRoot }: any, config: any) {
@@ -337,7 +412,7 @@ async function execTaskRead({ taskId, stateRoot }: any, config: any) {
     const path = join(dir, name);
     return existsSync(path) ? readFile(path, "utf8") : "";
   };
-  return {
+  return withGuidance(paths, {
     status: await loadStatus(paths, taskId),
     files: {
       request: await readText("request.md"),
@@ -345,7 +420,7 @@ async function execTaskRead({ taskId, stateRoot }: any, config: any) {
       acceptance: await readText("acceptance.md"),
       reviewNotes: await readText("review-notes.md"),
     },
-  };
+  });
 }
 
 async function execTaskTransition({ taskId, state, outcome, summary, commentUrl, headRef, stateRoot }: any, config: any) {
@@ -353,7 +428,21 @@ async function execTaskTransition({ taskId, state, outcome, summary, commentUrl,
   const status = await loadStatus(paths, taskId);
   const allowed = ALLOWED_TRANSITIONS[status.state];
   if (!allowed?.has(state)) {
-    throw new Error(`Invalid transition for ${taskId}: ${status.state} -> ${state}`);
+    throw transitionError(taskId, status.state, state);
+  }
+  const result = await applyTransition(paths, status, state, { outcome, summary, commentUrl, headRef });
+  return withGuidance(paths, result);
+}
+
+async function applyTransition(
+  paths: ReturnType<typeof pathsFor>,
+  status: TaskStatus,
+  state: string,
+  extras: { outcome?: string; summary?: string; commentUrl?: string; headRef?: string } = {},
+): Promise<{ status: TaskStatus; queue: Awaited<ReturnType<typeof refreshQueue>> }> {
+  const allowed = ALLOWED_TRANSITIONS[status.state];
+  if (!allowed?.has(state)) {
+    throw transitionError(status.taskId, status.state, state);
   }
   const previousState = status.state;
   status.state = state;
@@ -362,7 +451,7 @@ async function execTaskTransition({ taskId, state, outcome, summary, commentUrl,
   }
   if (state === "awaiting_review") {
     status.review.startedAt ??= nowIso();
-    status.review.headRef = headRef ?? status.review.headRef;
+    status.review.headRef = extras.headRef ?? status.review.headRef;
   }
   if (state === "awaiting_manual_testing") {
     status.manualTesting.startedAt ??= nowIso();
@@ -372,18 +461,81 @@ async function execTaskTransition({ taskId, state, outcome, summary, commentUrl,
     status.manualTesting.completedAt ??= status.manualTesting.startedAt ? nowIso() : null;
   }
   const isManualTestingPhase = state === "awaiting_manual_testing" || previousState === "awaiting_manual_testing";
-  if (commentUrl) {
-    if (isManualTestingPhase) status.manualTesting.commentUrl = commentUrl;
-    else status.review.commentUrl = commentUrl;
+  if (extras.commentUrl) {
+    if (isManualTestingPhase) status.manualTesting.commentUrl = extras.commentUrl;
+    else status.review.commentUrl = extras.commentUrl;
   }
-  if (outcome) {
-    if (isManualTestingPhase) status.manualTesting.outcome = outcome;
-    else status.review.outcome = outcome;
+  if (extras.outcome) {
+    if (isManualTestingPhase) status.manualTesting.outcome = extras.outcome;
+    else status.review.outcome = extras.outcome;
   }
   await saveStatus(paths, status);
-  await appendEvent(paths, taskId, { type: "state_transition", state, summary: summary ?? null });
+  await appendEvent(paths, status.taskId, { type: "state_transition", state, summary: extras.summary ?? null });
   const queue = await refreshQueue(paths);
   return { status, queue };
+}
+
+async function execTaskStart({ taskId, summary, stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  let status = await loadStatus(paths, taskId);
+  if (TERMINAL_STATES.has(status.state)) {
+    throw new Error(`Cannot start ${taskId}: task is already terminal (${status.state}).`);
+  }
+  let queue = await refreshQueue(paths);
+  for (const state of ["preparing", "running"]) {
+    status = await loadStatus(paths, taskId);
+    if (status.state === state || status.state === "running" || status.state === "retry_running") break;
+    if (!ALLOWED_TRANSITIONS[status.state]?.has(state)) continue;
+    ({ status, queue } = await applyTransition(paths, status, state, { summary: summary ?? "Task started." }));
+  }
+  return withGuidance(paths, { status: await loadStatus(paths, taskId), queue });
+}
+
+function finishPath(current: string, result: string): string[] {
+  if (TERMINAL_STATES.has(current)) return [];
+  if (result === "cancelled") return ["cancelled"];
+  if (result === "blocked") {
+    if (current === "queued") return ["preparing", "running", "awaiting_worker_exit_reconcile", "blocked"];
+    if (current === "preparing") return ["running", "awaiting_worker_exit_reconcile", "blocked"];
+    if (current === "running" || current === "retry_running") return ["awaiting_worker_exit_reconcile", "blocked"];
+    if (current === "awaiting_pr" || current === "awaiting_review") return ["retry_planned", "blocked"];
+    if (current === "awaiting_worker_exit_reconcile" || current === "retry_planned") return ["blocked"];
+    if (current === "awaiting_manual_testing") return ["cancelled"];
+  }
+  if (result === "completed") {
+    if (current === "queued") return ["preparing", "running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+    if (current === "preparing") return ["running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+    if (current === "running" || current === "retry_running") return ["awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+    if (current === "awaiting_worker_exit_reconcile" || current === "awaiting_pr") return ["awaiting_review", "completed"];
+    if (current === "awaiting_review" || current === "awaiting_manual_testing") return ["completed"];
+  }
+  return [];
+}
+
+async function execTaskFinish({ taskId, result, outcome, summary, commentUrl, headRef, stateRoot }: any, config: any) {
+  const paths = await ensureRoot(stateRoot, config.stateRoot);
+  let status = await loadStatus(paths, taskId);
+  if (!FINISH_RESULTS.includes(result)) {
+    throw new Error(`Invalid finish result for ${taskId}: ${result}. Allowed results: ${FINISH_RESULTS.join(", ")}.`);
+  }
+  if (TERMINAL_STATES.has(status.state)) {
+    return withGuidance(paths, { status, queue: await refreshQueue(paths) });
+  }
+  let queue = await refreshQueue(paths);
+  const path = finishPath(status.state, result);
+  if (path.length === 0) {
+    throw new Error(`Cannot finish ${taskId} as ${result} from ${status.state}. Allowed next states: ${allowedNextStates(status.state).join(", ") || "(none)"}.`);
+  }
+  for (const nextState of path) {
+    status = await loadStatus(paths, taskId);
+    ({ status, queue } = await applyTransition(paths, status, nextState, {
+      outcome: nextState === result ? outcome : undefined,
+      summary: nextState === result ? summary : `Auto-transition toward ${result}.`,
+      commentUrl: nextState === result ? commentUrl : undefined,
+      headRef: nextState === "awaiting_review" ? headRef : undefined,
+    }));
+  }
+  return withGuidance(paths, { status, queue });
 }
 
 async function execTaskUpdate({ taskId, request, context, acceptance, reviewNotes, stateRoot }: any, config: any) {
@@ -396,24 +548,26 @@ async function execTaskUpdate({ taskId, request, context, acceptance, reviewNote
   if (acceptance !== undefined) { await writeFile(join(dir, "acceptance.md"), acceptance, "utf8"); updated.push("acceptance"); }
   if (reviewNotes !== undefined) { await writeFile(join(dir, "review-notes.md"), reviewNotes, "utf8"); updated.push("reviewNotes"); }
   await appendEvent(paths, taskId, { type: "task_updated", files: updated as unknown as JsonValue });
-  return { taskId, updated };
+  return { taskId, updated, stateRoot: paths.root };
 }
 
 async function execQueueStatus({ stateRoot }: any, config: any) {
   const paths = await ensureRoot(stateRoot, config.stateRoot);
-  const statuses = await listStatuses(paths);
+  const { statuses, diagnostics } = await listStatuses(paths);
   const queue = await refreshQueue(paths);
   return {
+    stateRoot: paths.root,
     queue,
     active: statuses.filter((status) => ACTIVE_STATES.has(status.state)),
     pending: statuses.filter((status) => !TERMINAL_STATES.has(status.state) && !ACTIVE_STATES.has(status.state)),
     terminal: statuses.filter((status) => TERMINAL_STATES.has(status.state)),
+    diagnostics,
   };
 }
 
 async function execUsageReport({ stateRoot }: any, config: any) {
   const paths = await ensureRoot(stateRoot, config.stateRoot);
-  const statuses = await listStatuses(paths);
+  const { statuses, diagnostics } = await listStatuses(paths);
   const totals = statuses.reduce(
     (acc, status) => {
       acc.tasks += 1;
@@ -428,6 +582,7 @@ async function execUsageReport({ stateRoot }: any, config: any) {
   return {
     stateRoot: paths.root,
     totals,
+    diagnostics,
     tasks: statuses.map((status) => ({
       taskId: status.taskId,
       state: status.state,
@@ -441,6 +596,8 @@ export const _toolExecutors: Record<string, (input: any, config: any) => Promise
   archie_task_init: execTaskInit,
   archie_task_read: execTaskRead,
   archie_task_transition: execTaskTransition,
+  archie_task_start: execTaskStart,
+  archie_task_finish: execTaskFinish,
   archie_task_update: execTaskUpdate,
   archie_queue_status: execQueueStatus,
   archie_usage_report: execUsageReport,
@@ -454,7 +611,7 @@ export default defineToolPlugin({
   tools: (tool) => [
     tool({
       name: "archie_task_init",
-      description: "Create a durable Archie task directory and queued status record.",
+      description: "Create a durable Archie task directory and queued status record. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         taskId: Type.String({ description: "Stable task id, for example PROJ-123." }),
         title: Type.String({ description: "Human-readable task title." }),
@@ -473,7 +630,7 @@ export default defineToolPlugin({
     }),
     tool({
       name: "archie_task_read",
-      description: "Read an Archie task status and task notes.",
+      description: "Read an Archie task status and task notes. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         taskId: Type.String(),
         stateRoot: Type.Optional(Type.String()),
@@ -482,10 +639,10 @@ export default defineToolPlugin({
     }),
     tool({
       name: "archie_task_transition",
-      description: "Transition an Archie task through the durable lifecycle.",
+      description: "Strictly transition an Archie task by one legal lifecycle step. Prefer archie_task_start and archie_task_finish for common start/completion flows. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         taskId: Type.String(),
-        state: Type.String({ description: "Target lifecycle state." }),
+        state: Type.Enum(LIFECYCLE_STATES, { description: "Target lifecycle state." }),
         outcome: Type.Optional(Type.String({ description: "Phase outcome, e.g. approved, rejected, passed, failed." })),
         summary: Type.Optional(Type.String()),
         commentUrl: Type.Optional(Type.String()),
@@ -495,8 +652,32 @@ export default defineToolPlugin({
       execute: execTaskTransition,
     }),
     tool({
+      name: "archie_task_start",
+      description: "Convenience helper that starts implementation by walking queued/preparing tasks to running. Do not pass stateRoot unless intentionally overriding task storage.",
+      parameters: Type.Object({
+        taskId: Type.String(),
+        summary: Type.Optional(Type.String()),
+        stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
+      }),
+      execute: execTaskStart,
+    }),
+    tool({
+      name: "archie_task_finish",
+      description: "Convenience helper that finishes a task as completed, blocked, or cancelled by walking required lifecycle states. Do not pass stateRoot unless intentionally overriding task storage.",
+      parameters: Type.Object({
+        taskId: Type.String(),
+        result: Type.Enum(FINISH_RESULTS, { description: "Final task result." }),
+        outcome: Type.Optional(Type.String({ description: "Phase outcome, e.g. passed, failed, approved, blocked." })),
+        summary: Type.Optional(Type.String()),
+        commentUrl: Type.Optional(Type.String()),
+        headRef: Type.Optional(Type.String()),
+        stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
+      }),
+      execute: execTaskFinish,
+    }),
+    tool({
       name: "archie_task_update",
-      description: "Update task files (request, context, acceptance, review-notes) for an existing Archie task.",
+      description: "Update task files (request, context, acceptance, review-notes) for an existing Archie task. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         taskId: Type.String(),
         request: Type.Optional(Type.String()),
@@ -509,7 +690,7 @@ export default defineToolPlugin({
     }),
     tool({
       name: "archie_queue_status",
-      description: "Return active and queued Archie implementation tasks.",
+      description: "Return active and queued Archie implementation tasks. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),
@@ -517,7 +698,7 @@ export default defineToolPlugin({
     }),
     tool({
       name: "archie_usage_report",
-      description: "Summarize token/cost usage recorded in Archie task status files.",
+      description: "Summarize token/cost usage recorded in Archie task status files. Do not pass stateRoot unless intentionally overriding task storage.",
       parameters: Type.Object({
         stateRoot: Type.Optional(Type.String()),
       }),

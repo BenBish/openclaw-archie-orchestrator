@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -50,10 +50,20 @@ describe("metadata contract", () => {
       "archie_task_init",
       "archie_task_read",
       "archie_task_transition",
+      "archie_task_start",
+      "archie_task_finish",
       "archie_task_update",
       "archie_queue_status",
       "archie_usage_report",
     ]);
+  });
+
+  it("declares lifecycle state enum metadata", () => {
+    const transitionTool = getToolPluginMetadata(entry)?.tools.find((t) => t.name === "archie_task_transition");
+    expect(transitionTool?.parameters.properties?.state).toMatchObject({
+      type: "string",
+      enum: expect.arrayContaining(["queued", "running", "completed"]),
+    });
   });
 });
 
@@ -72,6 +82,13 @@ describe("archie_task_init", () => {
     expect(status.review).toMatchObject({ startedAt: null, completedAt: null, outcome: null, commentUrl: null, headRef: null });
     expect(status.manualTesting).toMatchObject({ startedAt: null, completedAt: null, outcome: null, commentUrl: null });
     expect(status.usage.totals).toEqual({ costUsd: 0, inputTokens: 0, outputTokens: 0, turns: 0 });
+  });
+
+  it("returns stateRoot and lifecycle guidance", async () => {
+    const result = await initTask("PROJ-GUIDE");
+    expect(result.stateRoot).toBe(stateRoot);
+    expect(result.allowedNextStates).toEqual(["preparing", "cancelled"]);
+    expect(result.suggestedNextTools).toContain("archie_task_start");
   });
 
   it("initialises the queue with no active task", async () => {
@@ -132,6 +149,8 @@ describe("archie_task_read", () => {
     expect(result.status.taskId).toBe("READ-1");
     expect(result.files.request).toBe("the request");
     expect(result.files.context).toContain("# Context");
+    expect(result.stateRoot).toBe(stateRoot);
+    expect(result.allowedNextStates).toEqual(["preparing", "cancelled"]);
   });
 
   it("throws for an unknown taskId", async () => {
@@ -174,7 +193,9 @@ describe("archie_task_transition", () => {
 
   it("throws for an invalid transition", async () => {
     await initTask("TR-4");
-    await expect(transition("TR-4", "completed")).rejects.toThrow("Invalid transition for TR-4: queued -> completed");
+    await expect(transition("TR-4", "completed")).rejects.toThrow(
+      "Invalid transition for TR-4: queued -> completed. Allowed next states: preparing, cancelled.",
+    );
   });
 
   it("sets review.startedAt on first entry to awaiting_review", async () => {
@@ -273,15 +294,93 @@ describe("archie_task_transition", () => {
   });
 });
 
+// ─── archie_task_start ────────────────────────────────────────────────────────
+
+describe("archie_task_start", () => {
+  it("walks queued tasks to running", async () => {
+    await initTask("START-1");
+    const { status, allowedNextStates, suggestedNextTools } = await exec("archie_task_start", { taskId: "START-1" });
+    expect(status.state).toBe("running");
+    expect(status.attempt).toBe(1);
+    expect(allowedNextStates).toEqual(["awaiting_worker_exit_reconcile", "cancelled"]);
+    expect(suggestedNextTools).toContain("archie_task_finish");
+  });
+
+  it("is safe to call for an already running task", async () => {
+    await initTask("START-2");
+    await exec("archie_task_start", { taskId: "START-2" });
+    const { status } = await exec("archie_task_start", { taskId: "START-2" });
+    expect(status.state).toBe("running");
+    expect(status.attempt).toBe(1);
+  });
+
+  it("rejects terminal tasks", async () => {
+    await initTask("START-3");
+    await exec("archie_task_finish", { taskId: "START-3", result: "completed" });
+    await expect(exec("archie_task_start", { taskId: "START-3" })).rejects.toThrow("Cannot start START-3: task is already terminal (completed).");
+  });
+});
+
+// ─── archie_task_finish ───────────────────────────────────────────────────────
+
+describe("archie_task_finish", () => {
+  it("walks queued tasks to completed", async () => {
+    await initTask("FIN-1");
+    const { status, queue } = await exec("archie_task_finish", { taskId: "FIN-1", result: "completed", outcome: "passed" });
+    expect(status.state).toBe("completed");
+    expect(status.attempt).toBe(1);
+    expect(status.review.outcome).toBe("passed");
+    expect(queue.items).toEqual([]);
+  });
+
+  it("walks running tasks to blocked", async () => {
+    await initTask("FIN-2");
+    await exec("archie_task_start", { taskId: "FIN-2" });
+    const { status } = await exec("archie_task_finish", { taskId: "FIN-2", result: "blocked", outcome: "failed" });
+    expect(status.state).toBe("blocked");
+    expect(status.review.outcome).toBe("failed");
+  });
+
+  it("cancels a queued task", async () => {
+    await initTask("FIN-3");
+    const { status } = await exec("archie_task_finish", { taskId: "FIN-3", result: "cancelled" });
+    expect(status.state).toBe("cancelled");
+  });
+
+  it("returns terminal tasks unchanged", async () => {
+    await initTask("FIN-4");
+    await exec("archie_task_finish", { taskId: "FIN-4", result: "completed" });
+    const { status } = await exec("archie_task_finish", { taskId: "FIN-4", result: "completed" });
+    expect(status.state).toBe("completed");
+    expect(status.attempt).toBe(1);
+  });
+
+  it("records each auto-transition event", async () => {
+    const { taskDir: dir } = await initTask("FIN-5");
+    await exec("archie_task_finish", { taskId: "FIN-5", result: "completed" });
+    const events = (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.map((event) => event.state).filter(Boolean)).toEqual([
+      "queued",
+      "preparing",
+      "running",
+      "awaiting_worker_exit_reconcile",
+      "awaiting_review",
+      "completed",
+    ]);
+  });
+});
+
 // ─── archie_queue_status ──────────────────────────────────────────────────────
 
 describe("archie_queue_status", () => {
   it("returns empty buckets for a fresh state root", async () => {
     const result = await exec("archie_queue_status");
+    expect(result.stateRoot).toBe(stateRoot);
     expect(result.active).toHaveLength(0);
     expect(result.pending).toHaveLength(0);
     expect(result.terminal).toHaveLength(0);
     expect(result.queue.activeTaskId).toBeNull();
+    expect(result.diagnostics).toEqual([]);
   });
 
   it("reflects active task once running", async () => {
@@ -313,6 +412,16 @@ describe("archie_queue_status", () => {
     expect(ids).toContain("Q-3");
     expect(ids).toContain("Q-4");
   });
+
+  it("reports malformed task diagnostics without crashing", async () => {
+    const dir = join(stateRoot, "tasks", "BAD-1");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "status.json"), JSON.stringify({ state: "queued" }), "utf8");
+    await initTask("Q-5");
+    const result = await exec("archie_queue_status");
+    expect(result.pending.map((t: { taskId: string }) => t.taskId)).toContain("Q-5");
+    expect(result.diagnostics).toEqual([{ taskId: "BAD-1", reason: "status.json is missing taskId or state" }]);
+  });
 });
 
 // ─── archie_usage_report ──────────────────────────────────────────────────────
@@ -335,6 +444,14 @@ describe("archie_usage_report", () => {
   it("reports correct stateRoot", async () => {
     const result = await exec("archie_usage_report");
     expect(result.stateRoot).toBe(stateRoot);
+  });
+
+  it("includes malformed task diagnostics", async () => {
+    const dir = join(stateRoot, "tasks", "BAD-USAGE");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "status.json"), "{", "utf8");
+    const result = await exec("archie_usage_report");
+    expect(result.diagnostics[0].taskId).toBe("BAD-USAGE");
   });
 });
 
