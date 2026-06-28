@@ -13,35 +13,26 @@ Verify that a packed plugin installs into a fresh OpenClaw home and that a model
 
 ## Commands
 
-From the plugin repo:
+Run the install-only smoke test first. It builds, validates, packs, installs into a fresh temporary OpenClaw home, and checks that the packed plugin loads.
 
 ```bash
-npm test
-npm run build
-openclaw --profile archie plugins build --root "$PWD" --entry ./dist/index.js
-openclaw --profile archie plugins validate --root "$PWD" --entry ./dist/index.js
-mkdir -p /tmp/openclaw-archie-e2e-pack
-npm --cache /tmp/openclaw-archie-npm-cache pack --pack-destination /tmp/openclaw-archie-e2e-pack
+npm run e2e:install
 ```
 
-Create a temp project with a passing baseline test, then install the tarball into a fresh OpenClaw home:
+Run the live smoke test when an authenticated OpenClaw profile has model access. This installs the packed plugin into that profile, temporarily points its workspace at the temp project, runs a live coding task, verifies Archie lifecycle completion, and restores the original workspace.
 
 ```bash
-export E2E_HOME=/tmp/openclaw-archie-e2e-home
-export E2E_REPO=/tmp/openclaw-archie-e2e-repo
-mkdir -p "$E2E_HOME" "$E2E_REPO"
-HOME="$E2E_HOME" openclaw setup --non-interactive --accept-risk --workspace "$E2E_REPO" || true
-HOME="$E2E_HOME" openclaw plugins install /tmp/openclaw-archie-e2e-pack/openclaw-plugin-archie-orchestrator-*.tgz
-HOME="$E2E_HOME" openclaw plugins inspect archie-orchestrator
+ARCHIE_E2E_PROFILE=archie npm run e2e:live
 ```
 
-Run the live agent with the installed plugin available in an authenticated profile whose configured workspace points at the temp project. The `agent` command uses the profile workspace, not the shell working directory.
+Optional environment variables:
 
-```bash
-openclaw --profile archie plugins install --force /tmp/openclaw-archie-e2e-pack/openclaw-plugin-archie-orchestrator-*.tgz
-openclaw --profile archie setup --non-interactive --accept-risk --workspace "$E2E_REPO" || true
-openclaw --profile archie agent --local --session-key archie-plugin-e2e --model mini --message "<small coding task prompt>"
-```
+- `ARCHIE_E2E_PROFILE`: authenticated OpenClaw profile for the live agent run. Defaults to `archie`.
+- `ARCHIE_E2E_BUILD_PROFILE`: OpenClaw profile used for plugin build/validate. Defaults to `ARCHIE_E2E_PROFILE`.
+- `ARCHIE_E2E_MODEL`: model alias/id for the live run. Defaults to `mini`.
+- `ARCHIE_E2E_AGENT_TIMEOUT`: live agent timeout in seconds. Defaults to `600`.
+- `ARCHIE_E2E_TMP`: temp root. Defaults to `/tmp`.
+- `ARCHIE_E2E_RUN_ID`: stable suffix for session/task ids.
 
 ## Acceptance
 
@@ -51,5 +42,6 @@ openclaw --profile archie agent --local --session-key archie-plugin-e2e --model 
 - The agent uses `archie_task_finish` after verification.
 - The temp project tests pass.
 - The task `status.json` ends with `"state": "completed"`.
+- The selected profile workspace is restored after the live run, even on failure.
 
 If code changes and tests pass but the task remains `queued`, the smoke test failed.
