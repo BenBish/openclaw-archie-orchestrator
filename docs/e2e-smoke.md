@@ -35,10 +35,11 @@ HOME="$E2E_HOME" openclaw plugins install /tmp/openclaw-archie-e2e-pack/openclaw
 HOME="$E2E_HOME" openclaw plugins inspect archie-orchestrator
 ```
 
-Run the live agent with the installed plugin available in the authenticated Archie profile:
+Run the live agent with the installed plugin available in an authenticated profile whose configured workspace points at the temp project. The `agent` command uses the profile workspace, not the shell working directory.
 
 ```bash
 openclaw --profile archie plugins install --force /tmp/openclaw-archie-e2e-pack/openclaw-plugin-archie-orchestrator-*.tgz
+openclaw --profile archie setup --non-interactive --accept-risk --workspace "$E2E_REPO" || true
 openclaw --profile archie agent --local --session-key archie-plugin-e2e --model mini --message "<small coding task prompt>"
 ```
 
