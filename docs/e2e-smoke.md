@@ -31,6 +31,8 @@ Optional environment variables:
 - `ARCHIE_E2E_BUILD_PROFILE`: OpenClaw profile used for plugin build/validate. Defaults to `ARCHIE_E2E_PROFILE`.
 - `ARCHIE_E2E_MODEL`: model alias/id for the live run. Defaults to `mini`.
 - `ARCHIE_E2E_AGENT_TIMEOUT`: live agent timeout in seconds. Defaults to `600`.
+- `ARCHIE_E2E_GATEWAY_SERVICE`: user service restarted after live profile plugin install. Defaults to `openclaw-gateway-$ARCHIE_E2E_PROFILE.service`.
+- `ARCHIE_E2E_SKIP_GATEWAY_RESTART`: set to `1` to skip the service restart.
 - `ARCHIE_E2E_TMP`: temp root. Defaults to `/tmp`.
 - `ARCHIE_E2E_RUN_ID`: stable suffix for session/task ids.
 

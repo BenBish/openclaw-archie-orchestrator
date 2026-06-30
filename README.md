@@ -21,6 +21,8 @@ npm test
 openclaw plugins install --link .
 ```
 
+For a local end-to-end checklist, see [docs/local-manual-test.md](docs/local-manual-test.md).
+
 ## What It Adds
 
 - `archie_task_init`: create task state and task files.

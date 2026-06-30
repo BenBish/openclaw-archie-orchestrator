@@ -11,11 +11,12 @@ const PROFILE = process.env.ARCHIE_E2E_PROFILE || "archie";
 const BUILD_PROFILE = process.env.ARCHIE_E2E_BUILD_PROFILE || PROFILE;
 const MODEL = process.env.ARCHIE_E2E_MODEL || "mini";
 const AGENT_TIMEOUT_SECONDS = process.env.ARCHIE_E2E_AGENT_TIMEOUT || "600";
+const GATEWAY_SERVICE = process.env.ARCHIE_E2E_GATEWAY_SERVICE || `openclaw-gateway-${PROFILE}.service`;
 const RUN_ID = process.env.ARCHIE_E2E_RUN_ID || `${Date.now()}`;
 const BASE_TMP = process.env.ARCHIE_E2E_TMP || "/tmp";
 const PACK_DIR = join(BASE_TMP, "openclaw-archie-e2e-pack");
 const INSTALL_HOME = join(BASE_TMP, "openclaw-archie-e2e-home");
-const REPO_DIR = join(BASE_TMP, "openclaw-archie-e2e-repo");
+const REPO_DIR = join(BASE_TMP, `openclaw-archie-e2e-repo-${RUN_ID.replace(/[^A-Za-z0-9_-]/g, "-")}`);
 const NPM_CACHE = join(BASE_TMP, "openclaw-archie-npm-cache");
 const TASK_ID = `ARCHIE-E2E-${RUN_ID.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 let activeWorkspaceRestore = null;
@@ -36,9 +37,16 @@ function run(command, args, options = {}) {
   });
   if ((result.error || result.status !== 0) && !options.allowFailure) {
     const detail = result.error ? `: ${result.error.message}` : "";
-    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}${detail}`);
+    const output = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join("\n");
+    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}${detail}${output ? `\n${output}` : ""}`);
   }
   return result;
+}
+
+function commandFailure(command, args, result) {
+  const detail = result.error ? `: ${result.error.message}` : "";
+  const output = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join("\n");
+  return new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}${detail}${output ? `\n${output}` : ""}`);
 }
 
 function restoreWorkspaceSync() {
@@ -95,6 +103,15 @@ function parseFirstJsonObject(output) {
     }
   }
   throw new Error(`Command output contained incomplete JSON:\n${output}`);
+}
+
+function restartProfileGateway() {
+  if (process.env.ARCHIE_E2E_SKIP_GATEWAY_RESTART === "1") return;
+  run("systemctl", ["--user", "restart", GATEWAY_SERVICE]);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureProject() {
@@ -212,6 +229,8 @@ async function runLive(packPath) {
   try {
     run("openclaw", ["--profile", PROFILE, "plugins", "install", "--force", packPath]);
     await setProfileWorkspace(PROFILE, REPO_DIR);
+    restartProfileGateway();
+    await sleep(2000);
     const message = [
       "Use the Archie Orchestrator plugin for this engineering task.",
       `Create durable task state with taskId ${TASK_ID}.`,
@@ -221,29 +240,40 @@ async function runLive(packPath) {
       "Run npm test.",
       "Finish the Archie task as completed with archie_task_finish if tests pass.",
     ].join(" ");
+    const agentArgs = [
+      "--profile",
+      PROFILE,
+      "agent",
+      "--local",
+      "--session-key",
+      `archie-plugin-e2e-${RUN_ID}`,
+      "--model",
+      MODEL,
+      "--timeout",
+      AGENT_TIMEOUT_SECONDS,
+      "--json",
+      "--message",
+      message,
+    ];
     const agent = run(
       "openclaw",
-      [
-        "--profile",
-        PROFILE,
-        "agent",
-        "--local",
-        "--session-key",
-        `archie-plugin-e2e-${RUN_ID}`,
-        "--model",
-        MODEL,
-        "--timeout",
-        AGENT_TIMEOUT_SECONDS,
-        "--json",
-        "--message",
-        message,
-      ],
-      { cwd: REPO_DIR, capture: true, timeout: (Number(AGENT_TIMEOUT_SECONDS) + 30) * 1000 },
+      agentArgs,
+      { cwd: REPO_DIR, capture: true, timeout: (Number(AGENT_TIMEOUT_SECONDS) + 30) * 1000, allowFailure: true },
     );
-    const parsed = parseFirstJsonObject(agent.stdout);
+    let parsed;
+    try {
+      parsed = parseFirstJsonObject(agent.stdout);
+    } catch {
+      throw commandFailure("openclaw", agentArgs, agent);
+    }
+    if (agent.status !== 0 && !agent.error?.message.includes("ETIMEDOUT")) {
+      throw commandFailure("openclaw", agentArgs, agent);
+    }
     const tools = parsed?.meta?.toolSummary?.tools || [];
     for (const tool of ["archie_task_init", "archie_task_start", "archie_task_finish"]) {
-      if (!tools.includes(tool)) throw new Error(`Live agent did not use ${tool}`);
+      if (!tools.includes(tool)) {
+        throw new Error(`Live agent did not use ${tool}. Observed tools: ${tools.length > 0 ? tools.join(", ") : "(none)"}`);
+      }
     }
     run("npm", ["test"], { cwd: REPO_DIR });
     const math = await readFile(join(REPO_DIR, "math.js"), "utf8");
