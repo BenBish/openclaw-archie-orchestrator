@@ -3,12 +3,16 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 const Type = {
     String: (options = {}) => ({
         type: "string",
         ...(options.description ? { description: options.description } : {}),
     }),
-    Number: () => ({ type: "number" }),
+    Number: (options = {}) => ({
+        type: "number",
+        ...(options.description ? { description: options.description } : {}),
+    }),
     Boolean: (options = {}) => ({
         type: "boolean",
         ...(options.description ? { description: options.description } : {}),
@@ -55,6 +59,9 @@ const LIFECYCLE_STATES = [
     "cancelled",
 ];
 const FINISH_RESULTS = ["completed", "blocked", "cancelled"];
+const ACKNOWLEDGE_INTEGRITY_VIOLATION_PARAM = Type.Optional(Type.Boolean({
+    description: "Required to proceed when this task's status.json fails its integrity check (missing or mismatched signature, usually meaning it was created or edited outside Archie's own tools). Investigate status.json and events.jsonl for this task before setting this to true; it re-signs the task going forward.",
+}));
 const CONFIG_SCHEMA = Type.Object({
     stateRoot: Type.Optional(Type.String({ description: "Directory where Archie task state is stored." })),
     worker: Type.Optional(Type.Object({
@@ -144,17 +151,45 @@ async function appendEvent(paths, taskId, event) {
     await mkdir(dirname(eventsPath), { recursive: true });
     await writeFile(eventsPath, `${JSON.stringify({ ...event, at: nowIso() })}\n`, { encoding: "utf8", flag: "a" });
 }
+function canonicalJson(value) {
+    if (value === null || typeof value !== "object")
+        return JSON.stringify(value);
+    if (Array.isArray(value))
+        return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+function computeIntegritySignature(core) {
+    // Normalize through a JSON round-trip first: JSON.stringify silently drops undefined-valued
+    // keys (e.g. unset optional fields like `repo`), so an in-memory object hashed before its
+    // first write would never match the same object re-hashed after being read back from disk.
+    const normalized = JSON.parse(JSON.stringify(core));
+    return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
+}
+function attachIntegrityState(raw) {
+    const { integrity, integrityViolation: _ignored, ...core } = raw;
+    const expected = computeIntegritySignature(core);
+    return { ...core, integrity, integrityViolation: integrity !== expected };
+}
+function assertIntegrity(taskId, status, acknowledge) {
+    if (status.integrityViolation && !acknowledge) {
+        throw new Error(`Refusing to modify ${taskId}: its status.json does not match the integrity signature recorded by the Archie Orchestrator plugin. This usually means it was created or edited outside the plugin's own tools (for example, an agent hand-writing state files when Archie tools were unavailable, or manual editing). Investigate status.json and events.jsonl for ${taskId} before proceeding; do not trust its recorded history without review. If you have reviewed it and are confident it is safe to continue, retry this call with acknowledgeIntegrityViolation: true — this re-signs the task going forward.`);
+    }
+}
 async function loadStatus(paths, taskId) {
     const path = statusPath(paths, taskId);
     if (!existsSync(path)) {
         throw new Error(`Task not found: ${taskId}`);
     }
-    return readJson(path);
+    const raw = await readJson(path);
+    return attachIntegrityState(raw);
 }
 async function saveStatus(paths, status) {
     status.updatedAt = nowIso();
-    await writeJson(statusPath(paths, status.taskId), status);
-    return status;
+    const { integrity: _oldIntegrity, integrityViolation: _oldViolation, ...core } = status;
+    const integrity = computeIntegritySignature(core);
+    await writeJson(statusPath(paths, status.taskId), { ...core, integrity });
+    return { ...core, integrity, integrityViolation: false };
 }
 function allowedNextStates(state) {
     return [...(ALLOWED_TRANSITIONS[state] ?? new Set())];
@@ -162,7 +197,11 @@ function allowedNextStates(state) {
 function suggestedNextTools(state) {
     if (state === "queued" || state === "preparing")
         return ["archie_task_start", "archie_task_transition"];
-    if (state === "running" || state === "retry_running" || state === "awaiting_worker_exit_reconcile" || state === "awaiting_review") {
+    if (state === "running" ||
+        state === "retry_running" ||
+        state === "awaiting_worker_exit_reconcile" ||
+        state === "awaiting_review" ||
+        state === "awaiting_manual_testing") {
         return ["archie_task_finish", "archie_task_transition"];
     }
     if (TERMINAL_STATES.has(state))
@@ -195,16 +234,16 @@ async function listStatuses(paths) {
         try {
             if (!(await stat(path)).isFile())
                 continue;
-            const status = await readJson(path);
-            if (!status || typeof status !== "object") {
+            const raw = await readJson(path);
+            if (!raw || typeof raw !== "object") {
                 diagnostics.push({ taskId: entry, reason: "status.json is not an object" });
                 continue;
             }
-            if (typeof status.taskId !== "string" || typeof status.state !== "string") {
+            if (typeof raw.taskId !== "string" || typeof raw.state !== "string") {
                 diagnostics.push({ taskId: entry, reason: "status.json is missing taskId or state" });
                 continue;
             }
-            statuses.push(status);
+            statuses.push(attachIntegrityState(raw));
         }
         catch (error) {
             diagnostics.push({ taskId: entry, reason: error instanceof Error ? error.message : "could not read status.json" });
@@ -307,9 +346,10 @@ async function execTaskRead({ taskId, stateRoot }, config) {
         },
     });
 }
-async function execTaskTransition({ taskId, state, outcome, summary, commentUrl, headRef, stateRoot }, config) {
+async function execTaskTransition({ taskId, state, outcome, summary, commentUrl, headRef, stateRoot, acknowledgeIntegrityViolation }, config) {
     const paths = await ensureRoot(stateRoot, config.stateRoot);
     const status = await loadStatus(paths, taskId);
+    assertIntegrity(taskId, status, acknowledgeIntegrityViolation);
     const allowed = ALLOWED_TRANSITIONS[status.state];
     if (!allowed?.has(state)) {
         throw transitionError(taskId, status.state, state);
@@ -356,11 +396,20 @@ async function applyTransition(paths, status, state, extras = {}) {
     const queue = await refreshQueue(paths);
     return { status, queue };
 }
-async function execTaskStart({ taskId, summary, stateRoot }, config) {
+async function execTaskStart({ taskId, summary, stateRoot, maxActiveWorkers, acknowledgeIntegrityViolation }, config) {
     const paths = await ensureRoot(stateRoot, config.stateRoot);
     let status = await loadStatus(paths, taskId);
+    assertIntegrity(taskId, status, acknowledgeIntegrityViolation);
     if (TERMINAL_STATES.has(status.state)) {
         throw new Error(`Cannot start ${taskId}: task is already terminal (${status.state}).`);
+    }
+    if (!ACTIVE_STATES.has(status.state)) {
+        const effectiveMaxActiveWorkers = maxActiveWorkers ?? config?.concurrency?.maxActiveWorkers ?? 1;
+        const { statuses } = await listStatuses(paths);
+        const otherActiveCount = statuses.filter((other) => other.taskId !== taskId && ACTIVE_STATES.has(other.state)).length;
+        if (otherActiveCount >= effectiveMaxActiveWorkers) {
+            throw new Error(`Cannot start ${taskId}: concurrency limit reached (${otherActiveCount}/${effectiveMaxActiveWorkers} active). Wait for an active task to finish, or pass maxActiveWorkers to override.`);
+        }
     }
     let queue = await refreshQueue(paths);
     for (const state of ["preparing", "running"]) {
@@ -371,9 +420,18 @@ async function execTaskStart({ taskId, summary, stateRoot }, config) {
             continue;
         ({ status, queue } = await applyTransition(paths, status, state, { summary: summary ?? "Task started." }));
     }
-    return withGuidance(paths, { status: await loadStatus(paths, taskId), queue });
+    return withGuidance(paths, {
+        status: await loadStatus(paths, taskId),
+        queue,
+        resolvedConfig: {
+            worker: config?.worker ?? null,
+            verification: config?.verification ?? null,
+            issueProvider: config?.issueProvider ?? null,
+            concurrency: config?.concurrency ?? null,
+        },
+    });
 }
-function finishPath(current, result) {
+function finishPath(current, result, requireManualTesting = false) {
     if (TERMINAL_STATES.has(current))
         return [];
     if (result === "cancelled")
@@ -393,22 +451,34 @@ function finishPath(current, result) {
             return ["cancelled"];
     }
     if (result === "completed") {
+        let path = [];
         if (current === "queued")
-            return ["preparing", "running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
-        if (current === "preparing")
-            return ["running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
-        if (current === "running" || current === "retry_running")
-            return ["awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
-        if (current === "awaiting_worker_exit_reconcile" || current === "awaiting_pr")
-            return ["awaiting_review", "completed"];
-        if (current === "awaiting_review" || current === "awaiting_manual_testing")
-            return ["completed"];
+            path = ["preparing", "running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+        else if (current === "preparing")
+            path = ["running", "awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+        else if (current === "running" || current === "retry_running")
+            path = ["awaiting_worker_exit_reconcile", "awaiting_review", "completed"];
+        else if (current === "awaiting_worker_exit_reconcile" || current === "awaiting_pr")
+            path = ["awaiting_review", "completed"];
+        else if (current === "awaiting_review" || current === "awaiting_manual_testing")
+            path = ["completed"];
+        else
+            return [];
+        // When manual testing is required, stop the auto-walk at awaiting_manual_testing instead of
+        // completing outright. A second archie_task_finish call (after manual testing) then completes
+        // it, since finishPath from awaiting_manual_testing always returns ["completed"] directly.
+        if (requireManualTesting && current !== "awaiting_manual_testing") {
+            const completedIndex = path.indexOf("completed");
+            path = [...path.slice(0, completedIndex), "awaiting_manual_testing"];
+        }
+        return path;
     }
     return [];
 }
-async function execTaskFinish({ taskId, result, outcome, summary, commentUrl, headRef, stateRoot }, config) {
+async function execTaskFinish({ taskId, result, outcome, summary, commentUrl, headRef, stateRoot, requireManualTesting, acknowledgeIntegrityViolation }, config) {
     const paths = await ensureRoot(stateRoot, config.stateRoot);
     let status = await loadStatus(paths, taskId);
+    assertIntegrity(taskId, status, acknowledgeIntegrityViolation);
     if (!FINISH_RESULTS.includes(result)) {
         throw new Error(`Invalid finish result for ${taskId}: ${result}. Allowed results: ${FINISH_RESULTS.join(", ")}.`);
     }
@@ -416,24 +486,27 @@ async function execTaskFinish({ taskId, result, outcome, summary, commentUrl, he
         return withGuidance(paths, { status, queue: await refreshQueue(paths) });
     }
     let queue = await refreshQueue(paths);
-    const path = finishPath(status.state, result);
+    const effectiveRequireManualTesting = requireManualTesting ?? config?.review?.requireManualTesting ?? false;
+    const path = finishPath(status.state, result, effectiveRequireManualTesting);
     if (path.length === 0) {
         throw new Error(`Cannot finish ${taskId} as ${result} from ${status.state}. Allowed next states: ${allowedNextStates(status.state).join(", ") || "(none)"}.`);
     }
+    const lastState = path[path.length - 1];
     for (const nextState of path) {
         status = await loadStatus(paths, taskId);
         ({ status, queue } = await applyTransition(paths, status, nextState, {
-            outcome: nextState === result ? outcome : undefined,
-            summary: nextState === result ? summary : `Auto-transition toward ${result}.`,
-            commentUrl: nextState === result ? commentUrl : undefined,
+            outcome: nextState === lastState ? outcome : undefined,
+            summary: nextState === lastState ? summary : `Auto-transition toward ${result}.`,
+            commentUrl: nextState === lastState ? commentUrl : undefined,
             headRef: nextState === "awaiting_review" ? headRef : undefined,
         }));
     }
     return withGuidance(paths, { status, queue });
 }
-async function execTaskUpdate({ taskId, request, context, acceptance, reviewNotes, stateRoot }, config) {
+async function execTaskUpdate({ taskId, request, context, acceptance, reviewNotes, stateRoot, acknowledgeIntegrityViolation }, config) {
     const paths = await ensureRoot(stateRoot, config.stateRoot);
-    await loadStatus(paths, taskId);
+    const status = await loadStatus(paths, taskId);
+    assertIntegrity(taskId, status, acknowledgeIntegrityViolation);
     const dir = taskDir(paths, taskId);
     const updated = [];
     if (request !== undefined) {
@@ -546,16 +619,21 @@ export default defineToolPlugin({
                 commentUrl: Type.Optional(Type.String()),
                 headRef: Type.Optional(Type.String()),
                 stateRoot: Type.Optional(Type.String()),
+                acknowledgeIntegrityViolation: ACKNOWLEDGE_INTEGRITY_VIOLATION_PARAM,
             }),
             execute: execTaskTransition,
         }),
         tool({
             name: "archie_task_start",
-            description: "Convenience helper that starts implementation by walking queued/preparing tasks to running. Do not pass stateRoot unless intentionally overriding task storage.",
+            description: "Convenience helper that starts implementation by walking queued/preparing tasks to running. Refuses to start a new task once concurrency.maxActiveWorkers active tasks already exist. Returns resolvedConfig (worker/verification/issueProvider/concurrency) as seen by this call; treat any null field as config not delivered in this runtime and confirm the setting directly rather than assuming a default. Do not pass stateRoot unless intentionally overriding task storage.",
             parameters: Type.Object({
                 taskId: Type.String(),
                 summary: Type.Optional(Type.String()),
                 stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
+                maxActiveWorkers: Type.Optional(Type.Number({
+                    description: "Override the plugin's concurrency.maxActiveWorkers config for this call. Defaults to 1 when neither this input nor config is available. Prefer setting this explicitly over relying on plugin config, since plugin config is not reliably delivered under all OpenClaw runtimes (e.g. some CLI one-shot / embedded agent runs).",
+                })),
+                acknowledgeIntegrityViolation: ACKNOWLEDGE_INTEGRITY_VIOLATION_PARAM,
             }),
             execute: execTaskStart,
         }),
@@ -570,6 +648,10 @@ export default defineToolPlugin({
                 commentUrl: Type.Optional(Type.String()),
                 headRef: Type.Optional(Type.String()),
                 stateRoot: Type.Optional(Type.String({ description: "Override Archie state root for this operation." })),
+                requireManualTesting: Type.Optional(Type.Boolean({
+                    description: "Override the plugin's review.requireManualTesting config for this call. When true and result is completed, stop at awaiting_manual_testing instead of completing; call archie_task_finish again after manual testing to complete. Prefer setting this explicitly over relying on plugin config, since plugin config is not reliably delivered under all OpenClaw runtimes (e.g. some CLI one-shot / embedded agent runs).",
+                })),
+                acknowledgeIntegrityViolation: ACKNOWLEDGE_INTEGRITY_VIOLATION_PARAM,
             }),
             execute: execTaskFinish,
         }),
@@ -583,6 +665,7 @@ export default defineToolPlugin({
                 acceptance: Type.Optional(Type.String()),
                 reviewNotes: Type.Optional(Type.String()),
                 stateRoot: Type.Optional(Type.String()),
+                acknowledgeIntegrityViolation: ACKNOWLEDGE_INTEGRITY_VIOLATION_PARAM,
             }),
             execute: execTaskUpdate,
         }),

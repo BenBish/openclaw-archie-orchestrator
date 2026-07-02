@@ -23,7 +23,7 @@ Use Archie Orchestrator to turn a requested implementation into durable task sta
 6. Launch the configured worker command using the task files as the source of truth, or implement directly when the user asked for a small local task.
 7. Run the configured CI and E2E commands.
 8. Review the diff before approval.
-9. Call `archie_task_finish` with `result: "completed"` after tests pass, or `result: "blocked"` with a clear summary when implementation cannot be completed.
+9. Call `archie_task_finish` with `result: "completed"` after tests pass, or `result: "blocked"` with a clear summary when implementation cannot be completed. If the project or user requires a manual testing step before completion, pass `requireManualTesting: true` explicitly on this call — do not rely on the plugin's `review.requireManualTesting` config alone, since plugin config is not reliably delivered to tool calls under every OpenClaw runtime. When that flag is set and the task isn't already past manual testing, the task lands in `awaiting_manual_testing` instead of `completed`; after manual testing is done, call `archie_task_finish` again with `result: "completed"` to complete it.
 
 ## Guardrails
 
@@ -32,3 +32,5 @@ Use Archie Orchestrator to turn a requested implementation into durable task sta
 - Do not merge a PR before review and manual testing requirements are complete.
 - Do not store secrets in task files.
 - Prefer project-local test commands from plugin config or repository docs.
+- Do not assume plugin config (e.g. `stateRoot`, `review.requireManualTesting`) reaches tool calls automatically. Pass known-important values explicitly as tool arguments when the caller has them.
+- Never edit Archie's task state files (`status.json`, `events.jsonl`, or anything under `stateRoot`) directly, and never hand-simulate what an Archie tool call would have done. If Archie tools are unavailable in a session, stop and report that blocker instead of proceeding — do not fabricate task state to make it look like the workflow completed. Archie tools reject calls against a task whose `status.json` fails its integrity check (returned as `integrityViolation: true`); this happens automatically when state was written outside the plugin's own tools, and requires an explicit `acknowledgeIntegrityViolation: true` after investigating the task before any further tool call on it will proceed.
