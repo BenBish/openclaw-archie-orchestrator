@@ -319,6 +319,60 @@ describe("archie_task_start", () => {
     await exec("archie_task_finish", { taskId: "START-3", result: "completed" });
     await expect(exec("archie_task_start", { taskId: "START-3" })).rejects.toThrow("Cannot start START-3: task is already terminal (completed).");
   });
+
+  it("returns resolvedConfig from the plugin config it was called with", async () => {
+    await initTask("START-4");
+    const { resolvedConfig } = await exec(
+      "archie_task_start",
+      { taskId: "START-4" },
+      { worker: { command: "claude" }, verification: { ciCommand: "npm test" }, issueProvider: { type: "linear" }, concurrency: { maxActiveWorkers: 2 } },
+    );
+    expect(resolvedConfig).toEqual({
+      worker: { command: "claude" },
+      verification: { ciCommand: "npm test" },
+      issueProvider: { type: "linear" },
+      concurrency: { maxActiveWorkers: 2 },
+    });
+  });
+
+  it("returns null resolvedConfig fields when config is empty", async () => {
+    await initTask("START-5");
+    const { resolvedConfig } = await exec("archie_task_start", { taskId: "START-5" });
+    expect(resolvedConfig).toEqual({ worker: null, verification: null, issueProvider: null, concurrency: null });
+  });
+
+  it("defaults concurrency to 1 active worker and rejects a second start", async () => {
+    await initTask("CONC-1");
+    await initTask("CONC-2");
+    await exec("archie_task_start", { taskId: "CONC-1" });
+    await expect(exec("archie_task_start", { taskId: "CONC-2" })).rejects.toThrow(
+      "Cannot start CONC-2: concurrency limit reached (1/1 active).",
+    );
+  });
+
+  it("respects a higher concurrency.maxActiveWorkers config value", async () => {
+    await initTask("CONC-3");
+    await initTask("CONC-4");
+    await exec("archie_task_start", { taskId: "CONC-3" }, { concurrency: { maxActiveWorkers: 2 } });
+    const { status } = await exec("archie_task_start", { taskId: "CONC-4" }, { concurrency: { maxActiveWorkers: 2 } });
+    expect(status.state).toBe("running");
+  });
+
+  it("respects an explicit maxActiveWorkers input over config", async () => {
+    await initTask("CONC-5");
+    await initTask("CONC-6");
+    await exec("archie_task_start", { taskId: "CONC-5" }, { concurrency: { maxActiveWorkers: 5 } });
+    await expect(exec("archie_task_start", { taskId: "CONC-6", maxActiveWorkers: 1 }, { concurrency: { maxActiveWorkers: 5 } })).rejects.toThrow(
+      "concurrency limit reached (1/1 active)",
+    );
+  });
+
+  it("does not block re-calling start on an already-active task even at the concurrency limit", async () => {
+    await initTask("CONC-7");
+    await exec("archie_task_start", { taskId: "CONC-7" });
+    const { status } = await exec("archie_task_start", { taskId: "CONC-7" });
+    expect(status.state).toBe("running");
+  });
 });
 
 // ─── archie_task_finish ───────────────────────────────────────────────────────
@@ -367,6 +421,107 @@ describe("archie_task_finish", () => {
       "awaiting_review",
       "completed",
     ]);
+  });
+
+  it("stamps review.completedAt when finishing directly from awaiting_manual_testing (regression)", async () => {
+    await initTask("FIN-6");
+    await advanceTo("FIN-6", "awaiting_manual_testing");
+    const { status } = await exec("archie_task_finish", { taskId: "FIN-6", result: "completed", outcome: "passed" });
+    expect(status.state).toBe("completed");
+    expect(status.review.completedAt).not.toBeNull();
+    expect(status.manualTesting.completedAt).not.toBeNull();
+  });
+});
+
+// ─── archie_task_finish with review.requireManualTesting ──────────────────────
+
+describe("archie_task_finish with review.requireManualTesting config", () => {
+  it("stops at awaiting_manual_testing instead of completing when requireManualTesting is true", async () => {
+    await initTask("MT-1");
+    await exec("archie_task_start", { taskId: "MT-1" });
+    const { status, suggestedNextTools } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-1", result: "completed" },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("awaiting_manual_testing");
+    expect(suggestedNextTools).toContain("archie_task_finish");
+  });
+
+  it("completes on a second finish call after manual testing", async () => {
+    await initTask("MT-2");
+    await exec("archie_task_start", { taskId: "MT-2" });
+    await exec("archie_task_finish", { taskId: "MT-2", result: "completed" }, { review: { requireManualTesting: true } });
+    const { status } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-2", result: "completed", outcome: "passed" },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("completed");
+    expect(status.manualTesting.outcome).toBe("passed");
+    expect(status.review.completedAt).not.toBeNull();
+    expect(status.manualTesting.completedAt).not.toBeNull();
+  });
+
+  it("does not gate blocked results", async () => {
+    await initTask("MT-3");
+    await exec("archie_task_start", { taskId: "MT-3" });
+    const { status } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-3", result: "blocked" },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("blocked");
+  });
+
+  it("does not gate cancelled results", async () => {
+    await initTask("MT-4");
+    const { status } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-4", result: "cancelled" },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("cancelled");
+  });
+
+  it("does not gate when requireManualTesting is false or unset", async () => {
+    await initTask("MT-5");
+    await exec("archie_task_start", { taskId: "MT-5" });
+    const { status } = await exec("archie_task_finish", { taskId: "MT-5", result: "completed" });
+    expect(status.state).toBe("completed");
+  });
+
+  it("does not re-gate a task already in awaiting_manual_testing", async () => {
+    await initTask("MT-6");
+    await advanceTo("MT-6", "awaiting_manual_testing");
+    const { status } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-6", result: "completed" },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("completed");
+  });
+
+  it("honors an explicit requireManualTesting input even when config is empty", async () => {
+    await initTask("MT-7");
+    await exec("archie_task_start", { taskId: "MT-7" });
+    const { status } = await exec("archie_task_finish", {
+      taskId: "MT-7",
+      result: "completed",
+      requireManualTesting: true,
+    });
+    expect(status.state).toBe("awaiting_manual_testing");
+  });
+
+  it("explicit requireManualTesting: false overrides a true config default", async () => {
+    await initTask("MT-8");
+    await exec("archie_task_start", { taskId: "MT-8" });
+    const { status } = await exec(
+      "archie_task_finish",
+      { taskId: "MT-8", result: "completed", requireManualTesting: false },
+      { review: { requireManualTesting: true } },
+    );
+    expect(status.state).toBe("completed");
   });
 });
 
@@ -500,5 +655,109 @@ describe("archie_task_update", () => {
     const updateEvent = lines.find((e: { type: string }) => e.type === "task_updated");
     expect(updateEvent).toBeDefined();
     expect(updateEvent.files).toContain("request");
+  });
+});
+
+// ─── status integrity ──────────────────────────────────────────────────────
+
+describe("status integrity", () => {
+  function statusFilePath(taskId: string) {
+    return join(stateRoot, "tasks", taskId, "status.json");
+  }
+
+  async function tamper(taskId: string, mutate: (raw: Record<string, unknown>) => void) {
+    const raw = JSON.parse(await readFile(statusFilePath(taskId), "utf8"));
+    mutate(raw);
+    await writeFile(statusFilePath(taskId), JSON.stringify(raw, null, 2), "utf8");
+  }
+
+  it("freshly created and re-read tasks have no integrity violation", async () => {
+    await initTask("INT-1");
+    const { status } = await exec("archie_task_read", { taskId: "INT-1" });
+    expect(status.integrityViolation).toBe(false);
+  });
+
+  it("flags a task whose status.json was hand-edited after creation", async () => {
+    await initTask("INT-2");
+    await tamper("INT-2", (raw) => {
+      raw.title = "tampered title";
+    });
+    const { status } = await exec("archie_task_read", { taskId: "INT-2" });
+    expect(status.integrityViolation).toBe(true);
+  });
+
+  it("flags a task whose status.json has no integrity field at all (e.g. hand-authored)", async () => {
+    await initTask("INT-3");
+    await tamper("INT-3", (raw) => {
+      delete raw.integrity;
+    });
+    const { status } = await exec("archie_task_read", { taskId: "INT-3" });
+    expect(status.integrityViolation).toBe(true);
+  });
+
+  it("refuses archie_task_transition on a violated task without acknowledgement", async () => {
+    await initTask("INT-4");
+    await tamper("INT-4", (raw) => {
+      raw.title = "tampered";
+    });
+    await expect(exec("archie_task_transition", { taskId: "INT-4", state: "preparing" })).rejects.toThrow(
+      "Refusing to modify INT-4",
+    );
+  });
+
+  it("refuses archie_task_start on a violated task without acknowledgement", async () => {
+    await initTask("INT-5");
+    await tamper("INT-5", (raw) => {
+      raw.title = "tampered";
+    });
+    await expect(exec("archie_task_start", { taskId: "INT-5" })).rejects.toThrow("Refusing to modify INT-5");
+  });
+
+  it("refuses archie_task_finish on a violated task without acknowledgement", async () => {
+    await initTask("INT-6");
+    await exec("archie_task_start", { taskId: "INT-6" });
+    await tamper("INT-6", (raw) => {
+      raw.title = "tampered";
+    });
+    await expect(exec("archie_task_finish", { taskId: "INT-6", result: "completed" })).rejects.toThrow(
+      "Refusing to modify INT-6",
+    );
+  });
+
+  it("refuses archie_task_update on a violated task without acknowledgement", async () => {
+    await initTask("INT-7");
+    await tamper("INT-7", (raw) => {
+      raw.title = "tampered";
+    });
+    await expect(exec("archie_task_update", { taskId: "INT-7", context: "new context" })).rejects.toThrow(
+      "Refusing to modify INT-7",
+    );
+  });
+
+  it("allows proceeding and re-signs the task when acknowledgeIntegrityViolation is true", async () => {
+    await initTask("INT-8");
+    await tamper("INT-8", (raw) => {
+      raw.title = "tampered";
+    });
+    const { status } = await exec("archie_task_transition", {
+      taskId: "INT-8",
+      state: "preparing",
+      acknowledgeIntegrityViolation: true,
+    });
+    expect(status.state).toBe("preparing");
+    // A follow-up call with no acknowledgement should now succeed, since the task was re-signed.
+    const { status: status2 } = await exec("archie_task_finish", { taskId: "INT-8", result: "completed" });
+    expect(status2.state).toBe("completed");
+  });
+
+  it("archie_queue_status surfaces integrityViolation without throwing", async () => {
+    await initTask("INT-9");
+    await tamper("INT-9", (raw) => {
+      raw.title = "tampered";
+    });
+    const { pending } = await exec("archie_queue_status", {});
+    const found = pending.find((task: { taskId: string }) => task.taskId === "INT-9");
+    expect(found).toBeDefined();
+    expect(found.integrityViolation).toBe(true);
   });
 });
